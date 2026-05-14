@@ -1,34 +1,41 @@
 import sounddevice as sd
 import numpy as np
 from scipy.io.wavfile import write
+from scipy.signal import butter, lfilter
 
+# Cấu hình
 FS = 48000
-DURATION = 5
-FILENAME = "test_super_thinh.wav"
+DURATION = 10 
+FILENAME = "max_tam_2m.wav"
 
-print(f"--- ĐANG THU ÂM 'SIÊU THÍNH' TRONG {DURATION} GIÂY ---")
+def butter_highpass(cutoff, fs, order=5):
+    nyq = 0.5 * fs
+    normal_cutoff = cutoff / nyq
+    b, a = butter(order, normal_cutoff, btype='high', analog=False)
+    return b, a
 
-# Thu âm thô (Raw)
+def apply_filter(data, cutoff=200, fs=48000):
+    b, a = butter_highpass(cutoff, fs, order=5)
+    return lfilter(b, a, data)
+
+print("--- ĐANG THU ÂM CHẾ ĐỘ 'VIỄN THÁM' 2M ---")
 recording = sd.rec(int(DURATION * FS), samplerate=FS, channels=1, dtype='float32')
 sd.wait()
 
-# --- BỘ LỌC NÂNG CẤP ---
-# 1. Khử DC Offset (Giúp âm thanh không bị lệch trục khi kích gain cao)
-recording = recording - np.mean(recording)
+# 1. Lọc bỏ nhiễu nền tần số thấp (Cực kỳ quan trọng để thu xa)
+filtered_audio = apply_filter(recording.flatten(), cutoff=200, fs=FS)
 
-# 2. Peak Normalization (Tự động kích âm lên kịch trần)
-max_peak = np.max(np.abs(recording))
-if max_peak > 0:
-    # Kích lên mức cao nhất có thể
-    processed_audio = recording / max_peak 
+# 2. Peak Normalization (Đẩy kịch trần)
+max_val = np.max(np.abs(filtered_audio))
+if max_val > 0.0001: # Tránh chia cho 0
+    processed_audio = filtered_audio / max_val
 else:
-    processed_audio = recording
+    processed_audio = filtered_audio
 
-# 3. Soft Clipping (Nếu muốn âm thanh nghe 'dày' hơn nữa)
-processed_audio = np.tanh(processed_audio) 
+# 3. Soft Limiter (Dùng hàm tanh để làm dày âm thanh ở xa)
+processed_audio = np.tanh(processed_audio * 2) 
 
-# --- LƯU FILE ---
+# Lưu file
 audio_int16 = (processed_audio * 32767).astype(np.int16)
 write(FILENAME, FS, audio_int16)
-
-print(f"Hoàn tất! File '{FILENAME}' đã được tối ưu độ nhạy.")
+print(f"Xong! Thử đứng xa 2m và nói thầm xem nhé.")
