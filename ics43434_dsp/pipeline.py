@@ -59,8 +59,9 @@ class Config:
     blocksize: int    = 2048             # frames per callback (~43 ms @ 48kHz)
 
     # DSP
-    pre_gain_db: float = 28.0            # Fixed boost before AGC.
-                                         # Raise to 34-38 if still too faint.
+    # Pre-gain: 24 dB for 1.5 m (only ~3.5 dB distance loss to compensate).
+    # Raise to 28 dB if the source is consistently quieter than speech level.
+    pre_gain_db: float = 24.0
     lib_path: str      = "./libaudio_dsp.so"
 
     # AI inference chunking
@@ -383,7 +384,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="ICS-43434 DSP + AI pipeline")
     parser.add_argument("--device",    default="default",   help="ALSA device name or index")
-    parser.add_argument("--gain",      type=float, default=28.0, help="Pre-gain in dB (default 28)")
+    parser.add_argument("--gain",      type=float, default=24.0, help="Pre-gain in dB (default 24, optimised for 1.5 m)")
     parser.add_argument("--log-wav",   default=None,        help="Path to save processed WAV")
     parser.add_argument("--list-devs", action="store_true", help="List audio devices and exit")
     args = parser.parse_args()
@@ -409,4 +410,3 @@ if __name__ == "__main__":
         print()
     finally:
         pipeline.stop()
-
