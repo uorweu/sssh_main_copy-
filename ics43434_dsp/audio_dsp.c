@@ -11,10 +11,19 @@
  *
  * Chain (in order):
  *   1. DC-offset removal   (1st-order IIR high-pass @ ~3 Hz)
- *   2. Fixed pre-gain      (configurable dB boost, default +24 dB)
- *   3. Adaptive Noise Gate (suppresses silence floors cleanly)
- *   4. AGC                 (keeps perceived loudness stable at 1.5 m)
- *   5. Soft Limiter        (prevents clipping at peak moments)
+ *   2. Rumble HPF          (2nd-order Butterworth high-pass @ 80 Hz)
+ *   3. Fixed pre-gain      (configurable dB boost, default +24 dB)
+ *   4. Adaptive Noise Gate (suppresses silence floors cleanly)
+ *   5. AGC                 (keeps perceived loudness stable at 1.5 m)
+ *   6. Soft Limiter        (prevents clipping at peak moments)
+ *
+ * The rumble HPF sits right after the DC block. The DC block only removes
+ * sub-3 Hz drift; the 40-80 Hz band (HVAC, fans, the Pi's own supply hum,
+ * footfall) sails straight through it. That low-frequency energy dominates
+ * the signal and pollutes everything downstream — pre-gain amplifies it,
+ * the AGC reacts to it, and it muddies the audio the model sees.
+ * An 80 Hz Butterworth removes it cleanly: -12 dB @ 40 Hz, -6 dB @ 60 Hz,
+ * while speech (>200 Hz) is untouched.
  *
  * Build as shared lib:
  *   gcc -O2 -march=armv8-a -fPIC -shared -o libaudio_dsp.so audio_dsp.c -lm
@@ -39,6 +48,15 @@
    At 48 kHz, 0.9998 gives ~3 Hz corner — removes slow thermal drift
    without touching any audible content above 20 Hz.               */
 #define DC_BLOCK_R           0.9998f
+
+/* Rumble HPF — 2nd-order Butterworth high-pass @ 80 Hz, 48 kHz.
+   Transposed-Direct-Form-II biquad. Coefficients precomputed (a0 = 1).
+   Removes HVAC/fan/footfall rumble that the gentle DC block lets through. */
+#define RUMBLE_B0            0.9926225428f
+#define RUMBLE_B1           -1.9852450855f
+#define RUMBLE_B2            0.9926225428f
+#define RUMBLE_A1           -1.9851906579f
+#define RUMBLE_A2            0.9852995131f
 
 /* AGC time constants — tightened for 1.5 m (better SNR, less compensation needed)
  *   ATTACK  3 ms   (was  5 ms) : reacts faster to sudden loud events
@@ -68,6 +86,10 @@ typedef struct {
     /* DC block */
     float dc_x_prev;
     float dc_y_prev;
+
+    /* Rumble HPF biquad (transposed DF-II state) */
+    float rumble_z1;
+    float rumble_z2;
 
     /* Pre-gain (linear) */
     float pre_gain;
@@ -189,10 +211,16 @@ int dsp_process(DspContext *ctx, float *buf, int n_frames)
         s->dc_y_prev = y;
         x = y;
 
-        /* ── 3. Fixed pre-gain ────────────────────────────────────────── */
+        /* ── 3. Rumble HPF (2nd-order Butterworth, transposed DF-II) ──── */
+        float out = RUMBLE_B0 * x + s->rumble_z1;
+        s->rumble_z1 = RUMBLE_B1 * x - RUMBLE_A1 * out + s->rumble_z2;
+        s->rumble_z2 = RUMBLE_B2 * x - RUMBLE_A2 * out;
+        x = out;
+
+        /* ── 4. Fixed pre-gain ────────────────────────────────────────── */
         x *= s->pre_gain;
 
-        /* ── 4. Noise gate ────────────────────────────────────────────── */
+        /* ── 5. Noise gate ────────────────────────────────────────────── */
         float ax = fabsf(x);
         /* Envelope follower on the pre-gain signal */
         if (ax > s->gate_env)
@@ -210,7 +238,7 @@ int dsp_process(DspContext *ctx, float *buf, int n_frames)
                      + (1.0f - gate_coeff) * target_gate;
         x *= s->gate_gain;
 
-        /* ── 5. AGC ───────────────────────────────────────────────────── */
+        /* ── 6. AGC ───────────────────────────────────────────────────── */
         float absx = fabsf(x);
         /* Peak-following envelope (asymmetric) */
         if (absx > s->agc_env)
@@ -233,7 +261,7 @@ int dsp_process(DspContext *ctx, float *buf, int n_frames)
         }
         x *= s->agc_gain;
 
-        /* ── 6. Soft limiter ──────────────────────────────────────────── */
+        /* ── 7. Soft limiter ──────────────────────────────────────────── */
         x = soft_limit(x);
 
         buf[i] = x;
