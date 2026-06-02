@@ -26,6 +26,7 @@ import os
 import queue
 import struct
 import threading
+
 import time
 import wave
 from dataclasses import dataclass, field
@@ -34,14 +35,11 @@ from typing import Callable, Optional
 
 import numpy as np
 
-try:
-    from scipy import signal as sig
-except ImportError:
-    raise SystemExit("Install scipy:  pip install scipy")
 
 try:
     import sounddevice as sd
 except ImportError:
+
     raise SystemExit("Install sounddevice:  pip install sounddevice")
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
@@ -69,14 +67,11 @@ class Config:
     pre_gain_db: float = 24.0
     lib_path: str      = "./libaudio_dsp.so"
 
-    # Sound-level metering (the project's headline output: "how loud is the room?")
-    # ICS-43434 datasheet: -26 dBFS at 94 dB SPL @ 1 kHz.
-    # dB_SPL = dBFS + (ref_spl - sensitivity) = dBFS + 120.
-    # Trim spl_calibration_offset with a reference meter if you have one.
-    mic_sensitivity_dbfs: float = -26.0
-    spl_ref_db:           float = 94.0
-    spl_calibration_offset: float = 0.0
-    spl_a_weighting:      bool  = True   # A-weight to match human hearing (recommended)
+    # Stage switches. Defaults = full chain (gate + AGC on).
+    #   gate=False, agc=False -> transparent amp (most natural, has noise at range)
+    #   gate=True,  agc=False -> amp + clean silences (recommended for distance)
+    gate_enabled: bool = True
+    agc_enabled:  bool = True
 
     # AI inference chunking
     # Feeds the model a 1-second window, stepped every 0.5 s (50% overlap)
@@ -88,6 +83,7 @@ class Config:
 
     # Monitoring — print stats every N seconds (0 = off)
     stats_interval_s: float = 5.0
+
 
 # ─── C library bindings ───────────────────────────────────────────────────────
 
@@ -122,6 +118,12 @@ class DspLibrary:
         self._lib.dsp_set_pre_gain_db.restype  = None
         self._lib.dsp_set_pre_gain_db.argtypes = [ctypes.c_void_p, ctypes.c_float]
 
+        self._lib.dsp_set_gate_enabled.restype  = None
+        self._lib.dsp_set_gate_enabled.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
+        self._lib.dsp_set_agc_enabled.restype  = None
+        self._lib.dsp_set_agc_enabled.argtypes = [ctypes.c_void_p, ctypes.c_int]
+
         self._lib.dsp_process.restype  = ctypes.c_int
         self._lib.dsp_process.argtypes = [
             ctypes.c_void_p,
@@ -130,6 +132,7 @@ class DspLibrary:
         ]
 
         self._lib.dsp_get_stats.restype  = None
+
         self._lib.dsp_get_stats.argtypes = [ctypes.c_void_p,
                                              ctypes.POINTER(_DspStats)]
 
@@ -147,6 +150,7 @@ class DspLibrary:
         assert samples.dtype == np.float32
         samples = np.ascontiguousarray(samples)
         ptr = samples.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+
         ret = self._lib.dsp_process(self._ctx, ptr, ctypes.c_int(len(samples)))
         if ret != 0:
             log.warning("dsp_process() returned %d", ret)
@@ -155,70 +159,22 @@ class DspLibrary:
     def set_pre_gain_db(self, db: float):
         self._lib.dsp_set_pre_gain_db(self._ctx, ctypes.c_float(db))
 
+    def set_gate_enabled(self, enabled: bool):
+        self._lib.dsp_set_gate_enabled(self._ctx, ctypes.c_int(1 if enabled else 0))
+
+
+    def set_agc_enabled(self, enabled: bool):
+        self._lib.dsp_set_agc_enabled(self._ctx, ctypes.c_int(1 if enabled else 0))
+
     def get_stats(self) -> _DspStats:
         stats = _DspStats()
         self._lib.dsp_get_stats(self._ctx, ctypes.byref(stats))
         return stats
 
+
     def __del__(self):
         if hasattr(self, "_ctx") and self._ctx:
             self._lib.dsp_destroy(self._ctx)
-
-
-# ─── Sound-level meter ──────────────────────────────────────────────────────────
-
-class SplMeter:
-    """
-    Measures calibrated, A-weighted sound pressure level (dB SPL) from the
-    RAW microphone signal — i.e. BEFORE pre-gain/gate/AGC. This matters: the
-    DSP chain deliberately distorts levels (AGC normalises loudness), so SPL
-    must be read from the untouched input or the "how loud is the room?"
-    number would be meaningless.
-
-    Calibration
-    ───────────
-    The ICS-43434 outputs -26 dBFS at 94 dB SPL @ 1 kHz. sounddevice presents
-    the 24-bit (left-justified S32) samples as float32 in [-1, 1] where
-    full-scale = 0 dBFS. So:
-        dB_SPL = dBFS + (spl_ref_db - sensitivity_dbfs) + calibration_offset
-               = dBFS + 120 (+ trim)
-    If you own a reference sound-level meter, play a steady tone, compare, and
-    put the difference in `spl_calibration_offset`.
-    """
-
-    def __init__(self, sample_rate, sensitivity_dbfs=-26.0, ref_spl=94.0,
-                 calibration_offset=0.0, a_weighting=True):
-        self._offset = ref_spl - sensitivity_dbfs + calibration_offset
-        self._a_weighting = a_weighting
-        if a_weighting:
-            self._sos = self._design_a_weighting(sample_rate)
-            self._zi = sig.sosfilt_zi(self._sos)
-
-    @staticmethod
-    def _design_a_weighting(sr):
-        """IEC 61672 A-weighting as a digital biquad cascade."""
-        f1, f2, f3, f4 = 20.598997, 107.65265, 737.86223, 12194.217
-        A1000 = 1.9997
-        nums = [(2 * np.pi * f4) ** 2 * (10 ** (A1000 / 20)), 0, 0, 0, 0]
-        dens = np.convolve(
-            [1, 4 * np.pi * f4, (2 * np.pi * f4) ** 2],
-            [1, 4 * np.pi * f1, (2 * np.pi * f1) ** 2],
-        )
-        dens = np.convolve(np.convolve(dens, [1, 2 * np.pi * f3]),
-                           [1, 2 * np.pi * f2])
-        b, a = sig.bilinear(nums, dens, sr)
-        return sig.tf2sos(b, a)
-
-    def measure(self, raw_block: np.ndarray) -> float:
-        """raw_block: UNPROCESSED float32 mono. Returns dB SPL (A-weighted if enabled)."""
-        if self._a_weighting:
-            weighted, self._zi = sig.sosfilt(self._sos, raw_block, zi=self._zi)
-            rms = np.sqrt(np.mean(weighted * weighted) + 1e-20)
-        else:
-            rms = np.sqrt(np.mean(raw_block * raw_block) + 1e-20)
-        if rms < 1e-10:
-            return 0.0
-        return float(20.0 * np.log10(rms) + self._offset)
 
 
 # ─── Inference buffer ─────────────────────────────────────────────────────────
@@ -249,6 +205,7 @@ class OverlapBuffer:
             self._filled += take
             pos          += take
 
+
             if self._filled == self._window:
                 yield self._buf.copy()
                 # Slide: discard 'step' samples, keep the overlap tail
@@ -276,6 +233,7 @@ class WavLogger:
 
 
 # ─── Main pipeline ────────────────────────────────────────────────────────────
+
 
 class AudioPipeline:
     """
@@ -305,13 +263,12 @@ class AudioPipeline:
         self._cfg      = cfg
         self._callback = inference_callback
         self._dsp      = DspLibrary(cfg.lib_path, cfg.pre_gain_db)
-        self._spl_meter = SplMeter(
-            sample_rate        = cfg.sample_rate,
-            sensitivity_dbfs   = cfg.mic_sensitivity_dbfs,
-            ref_spl            = cfg.spl_ref_db,
-            calibration_offset = cfg.spl_calibration_offset,
-            a_weighting        = cfg.spl_a_weighting,
-        )
+        self._dsp.set_gate_enabled(cfg.gate_enabled)
+        self._dsp.set_agc_enabled(cfg.agc_enabled)
+        log.info("Chain: pre-gain=%.1f dB | gate=%s | AGC=%s",
+                 cfg.pre_gain_db,
+                 "on" if cfg.gate_enabled else "off",
+                 "on" if cfg.agc_enabled else "off")
         self._infer_q: queue.Queue = queue.Queue(maxsize=16)
         self._stop_evt = threading.Event()
 
@@ -325,7 +282,6 @@ class AudioPipeline:
 
         self._stats_lock  = threading.Lock()
         self._last_stats  = None
-        self._last_spl_dba = 0.0
         self._frame_count = 0
 
     # ── ALSA callback (called from sounddevice's internal thread) ─────────────
@@ -337,17 +293,12 @@ class AudioPipeline:
         # indata shape: (frames, channels) — float32 in [-1, 1]
         mono = indata[:, 0].copy()      # extract mono channel
 
-        # Measure room SPL from the RAW signal, BEFORE the DSP touches levels.
-        # (The AGC normalises loudness, so SPL read post-DSP would be a lie.)
-        spl_dba = self._spl_meter.measure(mono)
-
-        # Run DSP in-place (this is the audio the model will see)
+        # Run DSP in-place
         mono = self._dsp.process(mono)
 
         # Log stats snapshot
         with self._stats_lock:
             self._last_stats  = self._dsp.get_stats()
-            self._last_spl_dba = spl_dba
             self._frame_count += frames
 
         # Feed WAV logger
@@ -378,19 +329,17 @@ class AudioPipeline:
 
     # ── Stats reporter ────────────────────────────────────────────────────────
 
+
     def _stats_reporter(self):
         while not self._stop_evt.is_set():
             time.sleep(self._cfg.stats_interval_s)
             with self._stats_lock:
                 s = self._last_stats
-                spl = self._last_spl_dba
                 fc = self._frame_count
             if s and self._cfg.stats_interval_s > 0:
-                weight = "dBA" if self._cfg.spl_a_weighting else "dBZ"
                 log.info(
-                    "ROOM LEVEL: %.1f %s  |  DSP in=%.1f dBFS out=%.1f dBFS  "
+                    "DSP stats | in=%.1f dBFS  out=%.1f dBFS  "
                     "AGC=%.1f dB  gate=%.2f  frames=%d",
-                    spl, weight,
                     s.rms_in_db, s.rms_out_db, s.agc_gain_db, s.gate_gain, fc,
                 )
 
@@ -442,15 +391,6 @@ class AudioPipeline:
         self._dsp.set_pre_gain_db(db)
         log.info("Pre-gain updated → %.1f dB", db)
 
-    def get_spl_dba(self) -> float:
-        """
-        Current room sound level in dB SPL (A-weighted if enabled).
-        This is the value the database/web modules will publish later.
-        Thread-safe.
-        """
-        with self._stats_lock:
-            return self._last_spl_dba
-
 
 # ─── Example AI model stub ────────────────────────────────────────────────────
 
@@ -482,16 +422,24 @@ if __name__ == "__main__":
     parser.add_argument("--gain",      type=float, default=24.0, help="Pre-gain in dB (default 24, optimised for 1.5 m)")
     parser.add_argument("--log-wav",   default=None,        help="Path to save processed WAV")
     parser.add_argument("--list-devs", action="store_true", help="List audio devices and exit")
+    parser.add_argument("--no-gate",   action="store_true", help="Disable the noise gate")
+    parser.add_argument("--no-agc",    action="store_true", help="Disable the AGC (recommended for natural sound at distance)")
+    parser.add_argument("--simple-amp", action="store_true", help="Transparent amp: disable BOTH gate and AGC (= --no-gate --no-agc)")
     args = parser.parse_args()
 
     if args.list_devs:
         print(sd.query_devices())
         raise SystemExit(0)
 
+    gate_on = not (args.no_gate or args.simple_amp)
+    agc_on  = not (args.no_agc  or args.simple_amp)
+
     cfg = Config(
         device_name    = args.device,
         pre_gain_db    = args.gain,
         log_wav_path   = args.log_wav,
+        gate_enabled   = gate_on,
+        agc_enabled    = agc_on,
         stats_interval_s = 5.0,
     )
 

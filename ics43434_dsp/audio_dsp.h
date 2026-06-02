@@ -17,6 +17,8 @@ typedef struct {
 DspContext *dsp_create(float pre_gain_db);
 void        dsp_destroy(DspContext *ctx);
 void        dsp_set_pre_gain_db(DspContext *ctx, float db);
+void        dsp_set_gate_enabled(DspContext *ctx, int enabled);
+void        dsp_set_agc_enabled(DspContext *ctx, int enabled);
 int         dsp_process(DspContext *ctx, float *buf, int n_frames);
 void        dsp_get_stats(DspContext *ctx, DspStats *stats);
 
