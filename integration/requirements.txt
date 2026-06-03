@@ -1,0 +1,19 @@
+# SSSH Phase 4 — Python dependencies (install on the Raspberry Pi 4)
+#
+#   python3 -m pip install -r requirements.txt
+#
+# System packages first (once):
+#   sudo apt install libasound2-dev libportaudio2
+
+numpy
+scipy                 # high-quality 48k->16k resampling (resample_poly)
+sounddevice           # ALSA capture
+pyyaml                # config.yaml loading
+influxdb-client       # write to InfluxDB 2.x on the laptop
+
+# --- Model runtime: install ONE of the following depending on your model ---
+# If your fine-tuned YAMNet is a SavedModel / .h5 / .keras:
+#   tensorflow            # full TF (heavier; works on Pi 4 64-bit OS)
+#
+# If it is a .tflite file (recommended for the Pi — much lighter):
+#   tflite-runtime        # OR the tflite bundled inside tensorflow
