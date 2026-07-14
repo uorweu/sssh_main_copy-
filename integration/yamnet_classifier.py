@@ -268,6 +268,6 @@ class YamnetClassifier:
         for idx in top_idx:
             label = (self.labels[idx]
                      if self.labels and idx < len(self.labels)
-                     else f"class_{idx}")
+                     else "Unidentified")
             results.append((int(idx), label, float(scores[idx])))
         return results

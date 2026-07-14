@@ -23,10 +23,23 @@ Schema
         event_active    (int 0/1)
         top_label       (string)
         suitability     (string)        ← quiet/moderate/busy/loud
+
+  measurement: "sssh_events"            ← FSM-based noise event summaries
+  tags:        device, location, dominant_class
+  fields:
+        start_time      (float, epoch)
+        end_time        (float, epoch)
+        duration_s      (float)
+        avg_spl_db      (float)
+        peak_spl_db     (float)
+        avg_density     (float)
+        dominant_class  (string)
+        class_counts    (string, JSON-encoded dict)
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -39,10 +52,10 @@ log = logging.getLogger("influx")
 
 @dataclass
 class InfluxConfig:
-    url: str = "http://192.168.1.50:8086"   # ← your laptop's IP / InfluxDB port
-    token: str = "CHANGE_ME"                # InfluxDB API token
-    org: str = "sssh"
-    bucket: str = "noise"
+    url: str = "http://100.65.252.55:8086"   # ← your laptop's IP / InfluxDB port
+    token: str = "HXHIrhYAe5sE-37tLnUQ34jshooUstA9BcuLCy0NzTofpjkaOwsh7yEWm4tRc5Sb48VxJ8Mt5g82epG58eBDyg=="                # InfluxDB API token
+    org: str = "Edge_computing"
+    bucket: str = "Noises"
     device: str = "pi4-01"                  # tag: which device
     location: str = "library-floor2"        # tag: where it is
     flush_interval_s: float = 2.0
@@ -105,10 +118,55 @@ class InfluxWriter:
               .field("is_noise", int(result.is_noise))
               .field("event_active", int(result.event_active))
               .field("top_label", str(result.top_label))
+              .field("state", str(result.state))
               .field("suitability", str(suitability))
               .time(int(result.ts * 1e9)))   # ns precision
         with self._lock:
             self._buf.append(p)
+
+    def record_event(self, event_summary, device: Optional[str] = None,
+                     location: Optional[str] = None):
+        """Queue one FSM EventSummary for writing to the sssh_events measurement.
+
+        Parameters
+        ----------
+        event_summary : EventSummary
+            A completed noise-event summary produced by the FSM, containing
+            start_time, end_time, duration_s, avg_spl_db, peak_spl_db,
+            avg_density, dominant_class, and class_counts.
+        device : str, optional
+            Override ``self.cfg.device`` for the device tag.
+        location : str, optional
+            Override ``self.cfg.location`` for the location tag.
+        """
+        p = self._Point("sssh_events") if self._Point else None
+        if p is None:
+            return
+
+        dev = device or self.cfg.device
+        loc = location or self.cfg.location
+
+        # Encode class_counts dict as a compact JSON string for storage.
+        counts_json = json.dumps(
+            event_summary.class_counts, separators=(",", ":"))
+
+        p = (p.tag("device", dev)
+              .tag("location", loc)
+              .tag("dominant_class", str(event_summary.dominant_class))
+              .field("start_time", float(event_summary.start_time))
+              .field("end_time", float(event_summary.end_time))
+              .field("duration_s", float(event_summary.duration_s))
+              .field("avg_spl_db", float(event_summary.avg_spl_db))
+              .field("peak_spl_db", float(event_summary.peak_spl_db))
+              .field("avg_density", float(event_summary.avg_density))
+              .field("dominant_class", str(event_summary.dominant_class))
+              .field("class_counts", counts_json)
+              .time(int(event_summary.end_time * 1e9)))   # ns precision
+        with self._lock:
+            self._buf.append(p)
+        log.info("Queued sssh_event: %s (%.1fs, peak=%.1f dB)",
+                 event_summary.dominant_class, event_summary.duration_s,
+                 event_summary.peak_spl_db)
 
     # ── Background flush ──────────────────────────────────────────────────────
 

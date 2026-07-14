@@ -13,8 +13,9 @@ Wires together every prior phase into one running edge service:
     yamnet_classifier.py  ──►  fine-tuned YAMNet  [Phase 1: classification]
         │  top class + score
         ▼
-    noise_analyzer.py  ──►  dB + duration + class  [Phase 4: "what is noise"]
-        │  noise decision + rolling density + suitability
+    noise_analyzer.py  ──►  FSM + dB + duration + class  [Phase 4: "what is noise"]
+        │  state-gated noise decision + rolling density + suitability
+        │  + event summaries on noise event completion
         ▼
     influx_writer.py  ──►  InfluxDB on laptop  [Phase 5: feeds Grafana]
 
@@ -39,7 +40,7 @@ from pipeline import AudioPipeline, Config as PipelineConfig, sd
 
 # Phase 4 components
 from yamnet_classifier import YamnetClassifier
-from noise_analyzer import NoiseAnalyzer, NoiseConfig
+from noise_analyzer import NoiseAnalyzer, NoiseConfig, EventSummary
 from influx_writer import InfluxWriter, InfluxConfig
 
 log = logging.getLogger("sssh")
@@ -50,7 +51,7 @@ log = logging.getLogger("sssh")
 DEFAULTS = {
     "audio": {
         "device": "default",
-        "pre_gain_db": 24.0,
+        "pre_gain_db": 24.0, # the config.yaml is override this part so just in case there is no config file then this DEFAULTS will take affect
         "gate_enabled": True,
         "agc_enabled": True,
         "inference_window_s": 1.0,
@@ -59,22 +60,28 @@ DEFAULTS = {
         "log_wav_path": None,
     },
     "model": {
-        "model_path": "~/sssh_main/yamnet",
+        "model_path": "~/sssh_main_copy/AI_model/sssh_head.tflite",
         "labels_path": None,
         "top_k": 3,
     },
     "noise": {
         "min_confidence": 0.30,
         "spl_offset_db": 0.0,
-        "spl_threshold_db": -35.0,
+        "spl_yellow_threshold_db": 55.0,
+        "spl_threshold_db": 75.0,
         "min_event_duration_s": 0.7,
         "density_window_s": 30.0,
+        "cooldown_s": 2.0,
+        "heartbeat_interval_s": 30.0,
+        "moderate_send_interval_s": 5.0,
+        "noise_send_interval_s": 2.0,
+        "unidentified_loud_timeout_s": 10.0,
     },
     "influx": {
-        "url": "http://192.168.1.50:8086",
-        "token": "CHANGE_ME",
-        "org": "sssh",
-        "bucket": "noise",
+        "url": "http://100.65.252.55:8086",
+        "token": "7degAPDbXgCwR-hRSUWHa6o_qufQB9o2P5oVMNsKmwb8ODtD2Yg02uMD7eFndYMzugJ_0XhmhMXyxuaxLhPEPw==",
+        "org": "Edge_computing",
+        "bucket": "Noises",
         "device": "pi4-01",
         "location": "library-floor2",
         "flush_interval_s": 2.0,
@@ -119,16 +126,28 @@ class SsshService:
             top_k=int(m.get("top_k", 3)),
         )
 
-        # 2. Noise analyzer (Phase 4 logic) -----------------------------------
+        # 2. Noise analyzer (Phase 4 FSM logic) -------------------------------
         n = cfg["noise"]
-        self.analyzer = NoiseAnalyzer(NoiseConfig(
-            min_confidence=float(n["min_confidence"]),
-            spl_offset_db=float(n["spl_offset_db"]),
-            spl_threshold_db=float(n["spl_threshold_db"]),
-            min_event_duration_s=float(n["min_event_duration_s"]),
-            density_window_s=float(n["density_window_s"]),
-            step_s=float(cfg["audio"]["inference_step_s"]),
-        ))
+        kwargs = {
+            "min_confidence": float(n["min_confidence"]),
+            "spl_offset_db": float(n["spl_offset_db"]),
+            "spl_yellow_threshold_db": float(n.get("spl_yellow_threshold_db", 55.0)),
+            "spl_threshold_db": float(n["spl_threshold_db"]),
+            "min_event_duration_s": float(n["min_event_duration_s"]),
+            "density_window_s": float(n["density_window_s"]),
+            "step_s": float(cfg["audio"]["inference_step_s"]),
+            "cooldown_s": float(n.get("cooldown_s", 2.0)),
+            "heartbeat_interval_s": float(n.get("heartbeat_interval_s", 30.0)),
+            "moderate_send_interval_s": float(n.get("moderate_send_interval_s", 5.0)),
+            "noise_send_interval_s": float(n.get("noise_send_interval_s", 2.0)),
+            "unidentified_loud_timeout_s": float(n.get("unidentified_loud_timeout_s", 10.0)),
+        }
+        if "disruptive_classes" in n:
+            kwargs["disruptive_classes"] = n["disruptive_classes"]
+        if "benign_classes" in n:
+            kwargs["benign_classes"] = n["benign_classes"]
+            
+        self.analyzer = NoiseAnalyzer(NoiseConfig(**kwargs))
 
         # 3. InfluxDB writer (Phase 5 sink) -----------------------------------
         self.influx = None
@@ -190,24 +209,36 @@ class SsshService:
             return
         top_idx, top_label, top_score = preds[0]
 
-        # Phase 4: decide noise (dB + duration + class) + density
+        # Phase 4: FSM-based noise decision (dB + duration + class) + density
         result = self.analyzer.update(
             top_label=top_label,
             top_score=top_score,
             rms_out_db=rms_out_db,
             ts=ts,
         )
-        suit = NoiseAnalyzer.suitability(result.noise_density)
+        suit = NoiseAnalyzer.suitability(result.noise_density, result.spl_db,
+                                          self.analyzer.cfg.spl_yellow_threshold_db,
+                                          self.analyzer.cfg.spl_threshold_db)
 
-        # Phase 5: ship to InfluxDB (or print in dry-run)
-        if self.dry_run:
-            flag = "NOISE" if result.is_noise else "     "
-            ev = "*" if result.event_active else " "
-            log.info("[%s%s] %-18s p=%.2f  spl=%5.1f dB  density=%.2f (%s)",
-                     flag, ev, top_label[:18], top_score,
-                     result.spl_db, result.noise_density, suit)
-        else:
-            self.influx.record(result, suit)
+        # Phase 5: print to console AND ship to InfluxDB
+        flag = "NOISE" if result.is_noise else "     "
+        send_marker = " → SEND" if result.should_send else ""
+        log.info("[%s] %s %-18s p=%.2f  spl=%5.1f dB  density=%.2f (%s)%s",
+                 result.state, flag, top_label[:18], top_score,
+                 result.spl_db, result.noise_density, suit, send_marker)
+        
+        if result.event_summary:
+            es = result.event_summary
+            log.info("  EVENT END: %s for %.1fs, avg=%.1f dB, peak=%.1f dB, dominant=%s",
+                     es.dominant_class, es.duration_s, es.avg_spl_db,
+                     es.peak_spl_db, es.dominant_class)
+
+        if not self.dry_run:
+            # Only send to InfluxDB when the FSM says so
+            if result.should_send:
+                self.influx.record(result, suit)
+            if result.event_summary:
+                self.influx.record_event(result.event_summary)
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 

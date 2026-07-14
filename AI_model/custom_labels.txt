@@ -1,0 +1,11 @@
+A01_Normal_Speech
+A04_Laughter
+A05_Cough
+B01_Footsteps_Hard_Floor
+B02_Chair_Drag
+C01_Page_Sound
+C02_Pen_Writing
+D01_Keyboard_Typing
+D02_Mouse_Click
+E01_AC_Hum
+I01_Silence_Room_Tone

@@ -3,33 +3,51 @@
 
 audio:
   device: "hw:1,0"          # ← ALSA device; run `python3 main.py --list-devs` to find it
-  pre_gain_db: 24.0          # 24 dB tuned for ~1.5 m (per Phase 3 notes)
+  pre_gain_db: 26.0          # 24 dB tuned for ~1.5 m (per Phase 3 notes)
   gate_enabled: true         # noise gate ON (recommended for distance)
-  agc_enabled: true          # AGC ON; set false for more natural levels at range
+  agc_enabled: false          # AGC ON; set false for more natural levels at range
   inference_window_s: 1.0    # YAMNet sees 1 s windows
   inference_step_s: 0.5      # stepped every 0.5 s (50% overlap)
   lib_path: "./libaudio_dsp.so"
-  log_wav_path: null         # e.g. "/tmp/capture.wav" to record processed audio
+  log_wav_path: "/home/raspberry_pi4/sssh_main_copy/captures/test_session.wav"
 
 model:
-  model_path: "~/sssh_main/AI_model/yamnet.tflite"   # ← your fine-tuned model FILE
-  labels_path: "~/sssh_main/AI_model/yamnet_class_map.csv"                  # ← path to your 30-class label list (txt or csv)
+  model_path: "~/sssh_main_copy/AI_model/sssh_head.tflite"   # ← your fine-tuned model FILE
+  labels_path: "~/sssh_main_copy/AI_model/custom_labels.txt"                  # ← path to your 11-class label list (txt or csv)
   top_k: 3
 
 noise:
   # A window is "noise" only if it is loud AND a disruptive class AND confident,
   # and it must persist past min_event_duration_s to count toward density.
   min_confidence: 0.30
-  spl_offset_db: 0.0         # ← calibration: SPL ≈ dBFS + this. 0 = relative scale
-  spl_threshold_db: -35.0    # below this estimated SPL = treated as quiet
+  spl_offset_db: 97.0         # ← calibration: SPL ≈ dBFS + this. 0 = relative scale
+  spl_yellow_threshold_db: 55.0 # ← Moderate (Yellow) noise threshold
+  spl_threshold_db: 75.0    # ← Loud (Red) noise threshold
   min_event_duration_s: 0.7  # ignore blips shorter than this (ambient)
   density_window_s: 30.0     # rolling window for the headline density metric
+  
+  # Specify explicit noise classes from your 11 custom labels
+  disruptive_classes:
+    - "A01_Normal_Speech"
+    - "A04_Laughter"
+
+  # FSM tunables
+  cooldown_s: 2.0              # grace period (s) before ending a noise event
+  heartbeat_interval_s: 20.0   # how often to send data in QUIET state (shows people present)
+  moderate_send_interval_s: 5.0 # how often to send data during moderate noise
+  noise_send_interval_s: 2.0   # how often to send data during loud noise
+  unidentified_loud_timeout_s: 2.0  # if unknown sound stays 75+ dB for this long, treat as noise
 
 influx:
-  url: "http://192.168.1.50:8086"   # ← your LAPTOP's IP and InfluxDB port
-  token: "CHANGE_ME"                 # ← InfluxDB API token
-  org: "sssh"                        # ← your InfluxDB org
-  bucket: "noise"                    # ← target bucket
+  url: "http://100.65.252.55:8086"   # ← your LAPTOP's IP and InfluxDB port through Tailscale network 
+  token: "7degAPDbXgCwR-hRSUWHa6o_qufQB9o2P5oVMNsKmwb8ODtD2Yg02uMD7eFndYMzugJ_0XhmhMXyxuaxLhPEPw=="                 # ← InfluxDB API token
+  org: "Edge_computing"                        # ← your InfluxDB org
+  bucket: "Noises"                    # ← target bucket
   device: "pi4-01"                   # tag identifying this device
   location: "library-floor2"         # tag identifying where it sits
   flush_interval_s: 2.0
+
+
+
+
+
