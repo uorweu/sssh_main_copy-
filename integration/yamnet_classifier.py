@@ -9,6 +9,11 @@ Responsibilities
         - Keras .h5 / .keras file
         - TFLite .tflite file
     (Your model lives at ~/sssh_main/yamnet — a *file*, not a folder.)
+  • Support a **two-stage TFLite pipeline** when both a YAMNet base model
+    (yamnet.tflite) and a custom classification head (sssh_head.tflite) are
+    provided.  In this mode raw 16 kHz audio is first passed through the
+    YAMNet base to extract 1024-dim embedding vectors, which are then
+    averaged over frames and fed into the head for final classification.
   • Resample the 48 kHz pipeline window down to 16 kHz mono (YAMNet's native rate).
   • Run inference and return the top class index, label and score.
 
@@ -18,6 +23,12 @@ YAMNet contract
   YAMNet (TF-Hub) returns (scores, embeddings, log_mel_spectrogram) where
   scores is shape (num_frames, num_classes).  A fine-tuned head may instead
   return a single (num_classes,) / (1, num_classes) vector.  Both are handled.
+
+Two-stage TFLite pipeline
+─────────────────────────
+  When yamnet_model_path is provided:
+    1. yamnet.tflite  — full YAMNet base: raw 16 kHz audio → (scores, embeddings, spectrogram)
+    2. sssh_head.tflite — custom head: averaged 1024-dim embeddings → 11-class scores
 
 Labels
 ──────
@@ -113,21 +124,39 @@ class YamnetClassifier:
 
     Parameters
     ──────────
-      model_path   : path to SavedModel dir, .h5/.keras file, or .tflite file
-      labels_path  : optional label list (see load_labels)
-      top_k        : how many top predictions to return
+      model_path       : path to SavedModel dir, .h5/.keras file, or .tflite file
+      labels_path      : optional label list (see load_labels)
+      top_k            : how many top predictions to return
+      yamnet_model_path: optional path to the full YAMNet base TFLite model
+                         (yamnet.tflite).  When provided, enables two-stage
+                         inference: base model extracts embeddings, then the
+                         head model (model_path) classifies them.
+      classify_min_db  : optional minimum RMS dB threshold.  When set,
+                         classify() will skip inference if the provided rms_db
+                         is below this value, returning 'Unidentified'.
     """
 
     def __init__(self, model_path: str, labels_path: Optional[str] = None,
-                 top_k: int = 3):
+                 top_k: int = 3, yamnet_model_path: Optional[str] = None,
+                 classify_min_db: Optional[float] = None):
         self.model_path = str(Path(model_path).expanduser())
         self.labels = load_labels(labels_path)
         self.top_k = top_k
+        self.classify_min_db = classify_min_db
         self._backend = None      # "tf" | "tflite"
         self._model = None
         self._tflite = None
         self._in_details = None
         self._out_details = None
+
+        # Two-stage pipeline: YAMNet base model
+        self._yamnet_model_path = (
+            str(Path(yamnet_model_path).expanduser()) if yamnet_model_path
+            else None
+        )
+        self._yamnet_tflite = None
+        self._yamnet_in_details = None
+        self._yamnet_out_details = None
 
         self._load()
 
@@ -140,6 +169,9 @@ class YamnetClassifier:
         # TFLite ------------------------------------------------------------
         if suffix == ".tflite":
             self._load_tflite(p)
+            # Load the YAMNet base model if provided (two-stage pipeline)
+            if self._yamnet_model_path:
+                self._load_yamnet_base(Path(self._yamnet_model_path))
             return
 
         # Keras file --------------------------------------------------------
@@ -160,6 +192,9 @@ class YamnetClassifier:
             if b"TFL3" in head:
                 log.info("Detected TFLite magic in %s", p)
                 self._load_tflite(p)
+                # Load the YAMNet base model if provided (two-stage pipeline)
+                if self._yamnet_model_path:
+                    self._load_yamnet_base(Path(self._yamnet_model_path))
                 return
             # HDF5 files start with \x89HDF
             if head[:4] == b"\x89HDF":
@@ -199,6 +234,26 @@ class YamnetClassifier:
         log.info("Loaded TFLite model: %s (input %s)",
                  p, self._in_details[0]["shape"])
 
+    def _load_yamnet_base(self, p: Path):
+        """Load the full YAMNet base TFLite model for two-stage inference."""
+        if not p.exists():
+            log.warning("YAMNet base model not found: %s — falling back to "
+                        "single-stage mode", p)
+            return
+        try:
+            import tflite_runtime.interpreter as tflite
+            self._yamnet_tflite = tflite.Interpreter(model_path=str(p))
+        except ImportError:
+            import tensorflow as tf
+            self._yamnet_tflite = tf.lite.Interpreter(model_path=str(p))
+        self._yamnet_tflite.allocate_tensors()
+        self._yamnet_in_details = self._yamnet_tflite.get_input_details()
+        self._yamnet_out_details = self._yamnet_tflite.get_output_details()
+        log.info("Two-stage mode: YAMNet base → custom head")
+        log.info("  YAMNet base loaded: %s (input %s, %d outputs)",
+                 p, self._yamnet_in_details[0]["shape"],
+                 len(self._yamnet_out_details))
+
     # ── Inference ─────────────────────────────────────────────────────────────
 
     def _run_tf(self, wav16: np.ndarray) -> np.ndarray:
@@ -221,7 +276,99 @@ class YamnetClassifier:
             scores = scores.mean(axis=0) if scores.shape[0] > 1 else scores[0]
         return scores.astype(np.float32)
 
+    def _extract_embeddings(self, wav16: np.ndarray) -> np.ndarray:
+        """
+        Run the YAMNet base model on 16 kHz audio and extract embeddings.
+
+        YAMNet TFLite models vary in their output layout:
+          • 3 outputs (TF Hub style): scores (N,521), embeddings (N,1024), spectrogram (N,64)
+          • 2 outputs: scores + embeddings (from export_yamnet_with_embeddings.py)
+          • 1 output: may be scores (N,521) only
+
+        Returns a single averaged embedding/feature vector.
+        """
+        inp = self._yamnet_in_details[0]
+        x = wav16.astype(np.float32)
+
+        # YAMNet base expects a 1-D waveform
+        if x.ndim > 1:
+            x = x.flatten()
+
+        self._yamnet_tflite.resize_tensor_input(inp["index"], list(x.shape))
+        self._yamnet_tflite.allocate_tensors()
+        self._yamnet_tflite.set_tensor(inp["index"], x)
+        self._yamnet_tflite.invoke()
+
+        # Collect all output tensors and log their shapes for debugging
+        all_outputs = []
+        for i, out_detail in enumerate(self._yamnet_out_details):
+            tensor = self._yamnet_tflite.get_tensor(out_detail["index"])
+            all_outputs.append(tensor)
+            if not hasattr(self, '_yamnet_shapes_logged'):
+                log.info("  YAMNet output[%d]: shape=%s dtype=%s",
+                         i, tensor.shape, tensor.dtype)
+        self._yamnet_shapes_logged = True
+
+        # Strategy 1: Find the tensor with last dimension == 1024 (embeddings)
+        embeddings = None
+        for tensor in all_outputs:
+            if tensor.ndim == 2 and tensor.shape[-1] == 1024:
+                embeddings = tensor
+                break
+
+        # Strategy 2: If only 1 output, use it directly (whatever it is).
+        # The head model was likely trained to accept this output shape.
+        if embeddings is None and len(all_outputs) == 1:
+            log.info("YAMNet has single output (shape=%s) — using it directly "
+                     "as input to the head model", all_outputs[0].shape)
+            embeddings = all_outputs[0]
+
+        # Strategy 3: Multiple outputs but none are 1024-dim.
+        # Pick the one with the largest last dimension (most likely embeddings).
+        if embeddings is None:
+            best = max(all_outputs, key=lambda t: t.shape[-1] if t.ndim >= 1 else 0)
+            log.warning("Could not identify 1024-dim embeddings output; "
+                        "using output with shape %s (largest last dim)", best.shape)
+            embeddings = best
+
+        # Average over frames → single vector
+        embeddings = np.asarray(embeddings, dtype=np.float32)
+        if embeddings.ndim == 2:
+            embeddings = np.mean(embeddings, axis=0)
+
+        return embeddings
+
+    def _run_head_tflite(self, embedding: np.ndarray) -> np.ndarray:
+        """
+        Run the classification head TFLite model on a single embedding vector.
+        The head expects input shape (1, 1024) or (1024,).
+        """
+        inp = self._in_details[0]
+        want = list(inp["shape"])
+        x = embedding.astype(np.float32)
+
+        # Match the head model's expected rank
+        if len(want) == 2:
+            x = x.reshape(1, -1)
+
+        self._tflite.resize_tensor_input(inp["index"], list(x.shape))
+        self._tflite.allocate_tensors()
+        self._tflite.set_tensor(inp["index"], x)
+        self._tflite.invoke()
+
+        out = self._tflite.get_tensor(self._out_details[0]["index"])
+        scores = np.asarray(out)
+        if scores.ndim == 2:
+            scores = scores.mean(axis=0) if scores.shape[0] > 1 else scores[0]
+        return scores.astype(np.float32)
+
     def _run_tflite(self, wav16: np.ndarray) -> np.ndarray:
+        # Two-stage pipeline: YAMNet base → embeddings → head
+        if self._yamnet_tflite is not None:
+            embedding = self._extract_embeddings(wav16)
+            return self._run_head_tflite(embedding)
+
+        # Single-stage fallback (backward compatible)
         inp = self._in_details[0]
         want = list(inp["shape"])
         x = wav16.astype(np.float32)
@@ -246,13 +393,24 @@ class YamnetClassifier:
             scores = scores.mean(axis=0) if scores.shape[0] > 1 else scores[0]
         return scores.astype(np.float32)
 
-    def classify(self, window_48k: np.ndarray
+    def classify(self, window_48k: np.ndarray,
+                 rms_db: Optional[float] = None
                  ) -> List[Tuple[int, str, float]]:
         """
         Classify one 48 kHz mono window.
         Returns a list of (class_index, label, score), highest score first,
         length == top_k (or fewer if the model has fewer classes).
+
+        If classify_min_db was set and rms_db is provided and below that
+        threshold, classification is skipped and [(0, 'Unidentified', 0.0)]
+        is returned to avoid classifying quiet ambient noise.
         """
+        # Gate on minimum dB level
+        if (self.classify_min_db is not None
+                and rms_db is not None
+                and rms_db < self.classify_min_db):
+            return [(0, 'Unidentified', 0.0)]
+
         wav16 = resample_48k_to_16k(window_48k)
         if wav16.size == 0:
             return []
@@ -271,3 +429,4 @@ class YamnetClassifier:
                      else "Unidentified")
             results.append((int(idx), label, float(scores[idx])))
         return results
+

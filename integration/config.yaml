@@ -15,10 +15,12 @@ model:
   model_path: "~/sssh_main_copy/AI_model/sssh_head.tflite"   # ← your fine-tuned model FILE
   labels_path: "~/sssh_main_copy/AI_model/custom_labels.txt"                  # ← path to your 11-class label list (txt or csv)
   top_k: 3
+  yamnet_model_path: "~/sssh_main_copy/AI_model/yamnet_with_embeddings.tflite"   # ← YAMNet base model for embeddings (two-stage inference)
 
 noise:
   # A window is "noise" only if it is loud AND a disruptive class AND confident,
   # and it must persist past min_event_duration_s to count toward density.
+  classify_min_db: -40.0       # ← skip AI classification below this dBFS (too quiet to classify)
   min_confidence: 0.30
   spl_offset_db: 97.0         # ← calibration: SPL ≈ dBFS + this. 0 = relative scale
   spl_yellow_threshold_db: 55.0 # ← Moderate (Yellow) noise threshold
@@ -40,12 +42,13 @@ noise:
 
 influx:
   url: "http://100.65.252.55:8086"   # ← your LAPTOP's IP and InfluxDB port through Tailscale network 
-  token: "7degAPDbXgCwR-hRSUWHa6o_qufQB9o2P5oVMNsKmwb8ODtD2Yg02uMD7eFndYMzugJ_0XhmhMXyxuaxLhPEPw=="                 # ← InfluxDB API token
+  token: "cifDpHRz0-uAMNgoUsoX6-6WBK-EhaVCfofDR2gSLMCdUuj_ZcCr2tNv_QOTan1aUJndJCjCSLmMbDGx960rbw=="                 # ← InfluxDB API token
   org: "Edge_computing"                        # ← your InfluxDB org
   bucket: "Noises"                    # ← target bucket
   device: "pi4-01"                   # tag identifying this device
-  location: "library-floor2"         # tag identifying where it sits
+  location: "room"         # tag identifying where it sits
   flush_interval_s: 2.0
+
 
 
 

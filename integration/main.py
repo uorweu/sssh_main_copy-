@@ -42,6 +42,7 @@ from pipeline import AudioPipeline, Config as PipelineConfig, sd
 from yamnet_classifier import YamnetClassifier
 from noise_analyzer import NoiseAnalyzer, NoiseConfig, EventSummary
 from influx_writer import InfluxWriter, InfluxConfig
+from led_controller import LedController
 
 log = logging.getLogger("sssh")
 
@@ -61,6 +62,7 @@ DEFAULTS = {
     },
     "model": {
         "model_path": "~/sssh_main_copy/AI_model/sssh_head.tflite",
+        "yamnet_model_path": None,
         "labels_path": None,
         "top_k": 3,
     },
@@ -76,14 +78,15 @@ DEFAULTS = {
         "moderate_send_interval_s": 5.0,
         "noise_send_interval_s": 2.0,
         "unidentified_loud_timeout_s": 10.0,
+        "classify_min_db": None,
     },
     "influx": {
         "url": "http://100.65.252.55:8086",
-        "token": "7degAPDbXgCwR-hRSUWHa6o_qufQB9o2P5oVMNsKmwb8ODtD2Yg02uMD7eFndYMzugJ_0XhmhMXyxuaxLhPEPw==",
+        "token": "cifDpHRz0-uAMNgoUsoX6-6WBK-EhaVCfofDR2gSLMCdUuj_ZcCr2tNv_QOTan1aUJndJCjCSLmMbDGx960rbw==",
         "org": "Edge_computing",
         "bucket": "Noises",
         "device": "pi4-01",
-        "location": "library-floor2",
+        "location": "room",
         "flush_interval_s": 2.0,
     },
 }
@@ -119,11 +122,14 @@ class SsshService:
 
         # 1. Classifier (Phase 1 model) ---------------------------------------
         m = cfg["model"]
+        n = cfg["noise"]
         log.info("Loading YAMNet model: %s", m["model_path"])
         self.classifier = YamnetClassifier(
             model_path=m["model_path"],
             labels_path=m.get("labels_path"),
             top_k=int(m.get("top_k", 3)),
+            yamnet_model_path=m.get("yamnet_model_path"),
+            classify_min_db=float(n["classify_min_db"]) if n.get("classify_min_db") is not None else None,
         )
 
         # 2. Noise analyzer (Phase 4 FSM logic) -------------------------------
@@ -160,7 +166,15 @@ class SsshService:
                 flush_interval_s=float(i.get("flush_interval_s", 2.0)),
             ))
 
-        # 4. DSP capture pipeline (Phase 3) -----------------------------------
+        # 4. LED Controller (Visualizer) --------------------------------------
+        n = cfg["noise"]
+        self.leds = LedController(
+            pin_green=17, pin_yellow=27, pin_red=22,
+            yellow_threshold=float(n.get("spl_yellow_threshold_db", 55.0)),
+            red_threshold=float(n.get("spl_threshold_db", 75.0)),
+        )
+
+        # 5. DSP capture pipeline (Phase 3) -----------------------------------
         a = cfg["audio"]
         self.pipe_cfg = PipelineConfig(
             device_name=a["device"],
@@ -204,7 +218,7 @@ class SsshService:
         rms_out_db = self._latest_rms_db_fn()
 
         # Phase 1: classify
-        preds = self.classifier.classify(window)
+        preds = self.classifier.classify(window, rms_db=rms_out_db)
         if not preds:
             return
         top_idx, top_label, top_score = preds[0]
@@ -219,6 +233,9 @@ class SsshService:
         suit = NoiseAnalyzer.suitability(result.noise_density, result.spl_db,
                                           self.analyzer.cfg.spl_yellow_threshold_db,
                                           self.analyzer.cfg.spl_threshold_db)
+        
+        # Update LEDs based on real-time dB level (no FSM/cooldown)
+        self.leds.update(result.spl_db)
 
         # Phase 5: print to console AND ship to InfluxDB
         flag = "NOISE" if result.is_noise else "     "
@@ -251,7 +268,9 @@ class SsshService:
         self.pipeline.stop()
         if self.influx:
             self.influx.close()
-        log.info("SSSH service stopped.")
+        if self.leds:
+            self.leds.close()
+        log.info("SSSH Service shutdown complete")
 
 
 # ─── Entry point ────────────────────────────────────────────────────────────────
@@ -295,3 +314,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

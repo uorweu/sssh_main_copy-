@@ -191,10 +191,22 @@ class NoiseAnalyzer:
         self._last_heartbeat_ts: float = 0.0
         self._last_noise_send_ts: float = 0.0
 
+        # Track last sent SPL color zone ("green"/"yellow"/"red") so we can
+        # force-send whenever the zone changes, even inside the same FSM state.
+        self._last_sent_spl_zone: str = "green"
+
         # Fallback tracker: how long has a loud-but-unclassified sound persisted?
         self._loud_unidentified_start: Optional[float] = None
 
     # ── Class policy ──────────────────────────────────────────────────────────
+
+    def _spl_zone(self, spl_db: float) -> str:
+        """Return the color zone for a given SPL value."""
+        if spl_db >= self.cfg.spl_threshold_db:
+            return "red"
+        elif spl_db >= self.cfg.spl_yellow_threshold_db:
+            return "yellow"
+        return "green"
 
     def _class_is_disruptive(self, label: str) -> bool:
         l = label.lower()
@@ -357,8 +369,17 @@ class NoiseAnalyzer:
 
         # ── should_send logic ─────────────────────────────────────────────────
         should_send = False
+        state_changed = (self._state != prev_state)
+        current_zone = self._spl_zone(spl_db)
+        zone_changed = (current_zone != self._last_sent_spl_zone)
 
-        if event_summary is not None:
+        if state_changed or zone_changed:
+            # Always send immediately on any FSM state transition OR whenever
+            # the SPL crosses a color boundary (green↔yellow, yellow↔red).
+            # This captures brief spikes even when the FSM stays in QUIET.
+            should_send = True
+
+        elif event_summary is not None:
             # Event just ended — always send the summary.
             should_send = True
 
@@ -385,6 +406,7 @@ class NoiseAnalyzer:
 
         # Update send timestamps when we actually send.
         if should_send:
+            self._last_sent_spl_zone = current_zone
             if self._state == State.QUIET:
                 self._last_heartbeat_ts = ts
             elif self._state == State.CONFIRMED_NOISE:
@@ -444,3 +466,4 @@ class NoiseAnalyzer:
             spl_level = 0   # quiet
 
         return _levels[max(density_level, spl_level)]
+
