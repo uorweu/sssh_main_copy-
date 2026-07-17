@@ -12,7 +12,7 @@ audio:
   log_wav_path: "/home/raspberry_pi4/sssh_main_copy/captures/test_session.wav"
 
 model:
-  model_path: "~/sssh_main_copy/AI_model/sssh_head.tflite"   # ← your fine-tuned model FILE
+  model_path: "~/sssh_main_copy/AI_model/eightynine.tflite"  # ← your fine-tuned model FILE
   labels_path: "~/sssh_main_copy/AI_model/custom_labels.txt"                  # ← path to your 11-class label list (txt or csv)
   top_k: 3
   yamnet_model_path: "~/sssh_main_copy/AI_model/yamnet_with_embeddings.tflite"   # ← YAMNet base model for embeddings (two-stage inference)

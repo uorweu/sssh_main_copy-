@@ -61,7 +61,7 @@ DEFAULTS = {
         "log_wav_path": None,
     },
     "model": {
-        "model_path": "~/sssh_main_copy/AI_model/sssh_head.tflite",
+        "model_path": "~/sssh_main_copy/AI_model/eightynine.tflite",
         "yamnet_model_path": None,
         "labels_path": None,
         "top_k": 3,

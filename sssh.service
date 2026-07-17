@@ -1,0 +1,31 @@
+[Unit]
+Description=SSSH Noise Detection Service
+Documentation=https://github.com/your-repo/sssh
+After=network.target sound.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=raspberry_pi4
+Group=raspberry_pi4
+
+# Run the shell wrapper that mirrors the exact manual sequence:
+# cd sssh_main_copy → source .venv/bin/activate → cd integration → python3 main.py
+WorkingDirectory=/home/raspberry_pi4/sssh_main_copy
+
+ExecStart=/bin/bash /home/raspberry_pi4/sssh_main_copy/start.sh
+
+# Restart the service automatically if it crashes
+Restart=on-failure
+RestartSec=5s
+
+# Give the Pi time to fully initialize audio hardware before starting
+TimeoutStartSec=30
+
+# Log everything via journald (view with: journalctl -u sssh -f)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=sssh
+
+[Install]
+WantedBy=multi-user.target
